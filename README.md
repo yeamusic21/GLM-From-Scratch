@@ -1,16 +1,21 @@
+# About
 
-01_prepare_fremtpl2.py
+Repo for building insurance GLMs from scratch using PyTorch
 
-Download freMTPL2
-       ↓
-Load frequency data
-       ↓
-Clean obvious invalid values
-       ↓
-Select modeling variables
-       ↓
-Train / validation / test split
-       ↓
-Save datasets
-       ↓
-Print basic diagnostics
+# Environment
+
+### Python Version
+
+Built in Python 3.12.3
+
+### Create env (Ubuntu)
+
+python3 -m venv .venv
+
+### Activate .venv
+
+source .venv/bin/activate
+
+### Install Libraries
+
+pip install -r requirements.txt
