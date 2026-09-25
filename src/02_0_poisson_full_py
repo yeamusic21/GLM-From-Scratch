@@ -1,0 +1,347 @@
+"""
+02_poisson.py
+
+Fit a Poisson frequency model using the train/validation/test datasets
+created by 01_train_validation_test_split.py.
+
+The data is assumed to already contain:
+    - ClaimNb: claim count
+    - Exposure: exposure
+    - one-hot encoded predictor variables
+
+Model:
+
+    log(E[ClaimNb]) = log(Exposure) + X @ beta
+
+The exposure term is included as an offset.
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DATA_DIR = PROJECT_ROOT / "data"
+MODEL_DIR = PROJECT_ROOT / "models"
+PREDICTION_DIR = PROJECT_ROOT / "predictions"
+
+TRAIN_FILE = DATA_DIR / "train.csv"
+VALIDATION_FILE = DATA_DIR / "validation.csv"
+TEST_FILE = DATA_DIR / "test.csv"
+
+
+# ---------------------------------------------------------------------------
+# Poisson model
+# ---------------------------------------------------------------------------
+
+class PoissonRegression:
+    """
+    Poisson regression estimated using Newton-Raphson / IRLS.
+
+    The model assumes:
+
+        E[y] = exposure * exp(X @ beta)
+
+    where exposure is supplied separately as an offset.
+    """
+
+    def __init__(self, max_iter=100, tolerance=1e-8):
+        self.max_iter = max_iter
+        self.tolerance = tolerance
+        self.beta = None
+
+    def fit(self, X, y, exposure):
+        """
+        Fit the Poisson regression model.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Predictor matrix.
+
+        y : np.ndarray
+            Claim counts.
+
+        exposure : np.ndarray
+            Exposure for each observation.
+        """
+
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        exposure = np.asarray(exposure, dtype=float)
+
+        # Add intercept.
+        X = np.column_stack([np.ones(X.shape[0]), X])
+
+        # Initial coefficients.
+        beta = np.zeros(X.shape[1])
+
+        offset = np.log(exposure)
+
+        for iteration in range(self.max_iter):
+
+            # Linear predictor.
+            eta = offset + X @ beta
+
+            # Prevent overflow in exp().
+            eta = np.clip(eta, -50, 50)
+
+            # Expected claim count.
+            mu = np.exp(eta)
+
+            # Gradient.
+            gradient = X.T @ (y - mu)
+
+            # Hessian.
+            weights = mu
+            hessian = -(X.T * weights) @ X
+
+            # Newton-Raphson update.
+            try:
+                step = np.linalg.solve(hessian, gradient)
+            except np.linalg.LinAlgError:
+                raise RuntimeError(
+                    "Poisson model failed because the Hessian "
+                    "was singular."
+                )
+
+            beta -= step
+
+            # Check convergence.
+            if np.max(np.abs(step)) < self.tolerance:
+                print(f"Model converged after {iteration + 1} iterations.")
+                break
+
+        else:
+            print(
+                f"Warning: model did not converge after "
+                f"{self.max_iter} iterations."
+            )
+
+        self.beta = beta
+
+        return self
+
+    def predict(self, X, exposure):
+        """
+        Predict expected claim count.
+        """
+
+        if self.beta is None:
+            raise RuntimeError("Model must be fitted before prediction.")
+
+        X = np.asarray(X, dtype=float)
+        exposure = np.asarray(exposure, dtype=float)
+
+        X = np.column_stack([np.ones(X.shape[0]), X])
+
+        eta = np.log(exposure) + X @ self.beta
+        eta = np.clip(eta, -50, 50)
+
+        return np.exp(eta)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def poisson_deviance(y, prediction):
+    """
+    Calculate mean Poisson deviance.
+
+    Lower is better.
+    """
+
+    y = np.asarray(y, dtype=float)
+    prediction = np.asarray(prediction, dtype=float)
+
+    prediction = np.maximum(prediction, 1e-12)
+
+    deviance = np.where(
+        y == 0,
+        prediction,
+        y * np.log(y / prediction) - (y - prediction),
+    )
+
+    return 2 * np.mean(deviance)
+
+
+def evaluate_model(model, data, name):
+    """
+    Evaluate the model on a dataset.
+    """
+
+    y = data["ClaimNb"].to_numpy(dtype=float)
+    exposure = data["Exposure"].to_numpy(dtype=float)
+
+    X = data.drop(
+        columns=["ClaimNb", "Exposure"]
+    ).to_numpy(dtype=float)
+
+    prediction = model.predict(X, exposure)
+
+    deviance = poisson_deviance(y, prediction)
+
+    print(f"{name} Poisson deviance: {deviance:.6f}")
+
+    return prediction, deviance
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+
+    print("Loading data...")
+
+    train = pd.read_csv(TRAIN_FILE)
+    validation = pd.read_csv(VALIDATION_FILE)
+    test = pd.read_csv(TEST_FILE)
+
+    print(f"Train:      {train.shape}")
+    print(f"Validation: {validation.shape}")
+    print(f"Test:       {test.shape}")
+
+    # -----------------------------------------------------------------------
+    # Prepare training data
+    # -----------------------------------------------------------------------
+
+    target = "ClaimNb"
+    exposure = "Exposure"
+
+    X_train = train.drop(
+        columns=[target, exposure]
+    ).to_numpy(dtype=float)
+
+    y_train = train[target].to_numpy(dtype=float)
+
+    exposure_train = train[exposure].to_numpy(dtype=float)
+
+    # -----------------------------------------------------------------------
+    # Fit model
+    # -----------------------------------------------------------------------
+
+    print("\nFitting Poisson frequency model...")
+
+    model = PoissonRegression(
+        max_iter=100,
+        tolerance=1e-8,
+    )
+
+    model.fit(
+        X=X_train,
+        y=y_train,
+        exposure=exposure_train,
+    )
+
+    # -----------------------------------------------------------------------
+    # Evaluate
+    # -----------------------------------------------------------------------
+
+    print("\nModel performance:")
+
+    train_prediction, train_deviance = evaluate_model(
+        model,
+        train,
+        "Train",
+    )
+
+    validation_prediction, validation_deviance = evaluate_model(
+        model,
+        validation,
+        "Validation",
+    )
+
+    test_prediction, test_deviance = evaluate_model(
+        model,
+        test,
+        "Test",
+    )
+
+    # -----------------------------------------------------------------------
+    # Save coefficients
+    # -----------------------------------------------------------------------
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    feature_names = [
+        "Intercept"
+    ] + [
+        column
+        for column in train.columns
+        if column not in [target, exposure]
+    ]
+
+    coefficients = pd.DataFrame(
+        {
+            "Feature": feature_names,
+            "Coefficient": model.beta,
+            "Relativity": np.exp(model.beta),
+        }
+    )
+
+    coefficient_file = MODEL_DIR / "poisson_coefficients.csv"
+
+    coefficients.to_csv(
+        coefficient_file,
+        index=False,
+    )
+
+    # -----------------------------------------------------------------------
+    # Save predictions
+    # -----------------------------------------------------------------------
+
+    PREDICTION_DIR.mkdir(parents=True, exist_ok=True)
+
+    train_output = train.copy()
+    train_output["PredictedClaimNb"] = train_prediction
+
+    validation_output = validation.copy()
+    validation_output["PredictedClaimNb"] = validation_prediction
+
+    test_output = test.copy()
+    test_output["PredictedClaimNb"] = test_prediction
+
+    train_output.to_csv(
+        PREDICTION_DIR / "poisson_train_predictions.csv",
+        index=False,
+    )
+
+    validation_output.to_csv(
+        PREDICTION_DIR / "poisson_validation_predictions.csv",
+        index=False,
+    )
+
+    test_output.to_csv(
+        PREDICTION_DIR / "poisson_test_predictions.csv",
+        index=False,
+    )
+
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+
+    print("\nResults")
+    print("-" * 40)
+    print(f"Train deviance:      {train_deviance:.6f}")
+    print(f"Validation deviance: {validation_deviance:.6f}")
+    print(f"Test deviance:       {test_deviance:.6f}")
+
+    print("\nSaved:")
+    print(f"  {coefficient_file}")
+    print(f"  {PREDICTION_DIR / 'poisson_train_predictions.csv'}")
+    print(f"  {PREDICTION_DIR / 'poisson_validation_predictions.csv'}")
+    print(f"  {PREDICTION_DIR / 'poisson_test_predictions.csv'}")
+
+
+if __name__ == "__main__":
+    main()
+
