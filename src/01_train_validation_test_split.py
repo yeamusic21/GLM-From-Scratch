@@ -5,13 +5,37 @@ Prepare the freMTPL2 dataset for downstream GLM modeling.
 
 This script:
 
-1. Loads the prepared freMTPL2 dataset.
-2. Splits the data into train, validation, and test sets.
-3. Converts continuous rating variables into categorical deciles.
-4. Treats missing values as their own category.
-5. One-hot encodes all rating variables.
-6. Ensures train, validation, and test have identical feature columns.
-7. Saves the resulting datasets for downstream modeling.
+    1. Loads the prepared freMTPL2 dataset.
+    2. Splits the data into train, validation, and test sets.
+    3. Converts continuous rating variables into categorical deciles.
+    4. Treats missing values as their own category.
+    5. One-hot encodes rating variables using reference-cell encoding.
+    6. Ensures train, validation, and test have identical feature columns.
+    7. Saves the resulting datasets for downstream modeling.
+
+Reference-cell encoding
+-----------------------
+
+For each rating variable, one category is intentionally omitted.
+
+For example, if VehGas contains:
+
+    A
+    D
+
+the resulting variables are:
+
+    VehGas_D
+
+and NOT:
+
+    VehGas_A
+    VehGas_D
+
+The omitted category becomes the reference category.
+
+The Poisson model will contain an intercept, so the intercept represents
+the baseline combination of all reference categories.
 
 The resulting datasets contain:
 
@@ -26,6 +50,7 @@ All model features are numeric 0/1 values.
 The modeling scripts therefore do NOT need to perform additional
 categorical encoding.
 """
+
 
 from pathlib import Path
 
@@ -139,13 +164,14 @@ def calculate_decile_edges(train, variable):
 
     values = train[variable].dropna()
 
-    # qcut can produce duplicate boundaries when many observations
-    # have the same value. np.unique removes duplicate edges.
+    # Calculate the 0%, 10%, 20%, ..., 100% quantiles.
     edges = np.quantile(
         values,
         np.linspace(0, 1, 11),
     )
 
+    # If duplicate values produce identical boundaries,
+    # remove the duplicate edges.
     edges = np.unique(edges)
 
     return edges
@@ -172,8 +198,7 @@ def convert_to_deciles(train, validation, test):
             variable,
         )
 
-        # If there are not enough unique values to create ten
-        # categories, pd.cut will simply use the available bins.
+        # Convert training values into decile categories.
         train[variable] = pd.cut(
             train[variable],
             bins=edges,
@@ -181,6 +206,8 @@ def convert_to_deciles(train, validation, test):
             duplicates="drop",
         )
 
+        # Apply the exact same training-derived bins
+        # to the validation data.
         validation[variable] = pd.cut(
             validation[variable],
             bins=edges,
@@ -188,6 +215,8 @@ def convert_to_deciles(train, validation, test):
             duplicates="drop",
         )
 
+        # Apply the exact same training-derived bins
+        # to the test data.
         test[variable] = pd.cut(
             test[variable],
             bins=edges,
@@ -195,7 +224,7 @@ def convert_to_deciles(train, validation, test):
             duplicates="drop",
         )
 
-        # Convert intervals to strings so that all rating variables
+        # Convert intervals to strings so all rating variables
         # can be handled consistently.
         train[variable] = train[variable].astype("object")
         validation[variable] = validation[variable].astype("object")
@@ -212,11 +241,15 @@ def fill_missing_categories(train, validation, test):
     """
     Convert missing rating-variable values into an explicit category.
 
-    This means missing values are represented by:
+    For example:
 
-        variable_Missing = 1
+        VehAge = NaN
 
-    rather than being dropped or imputed.
+    becomes:
+
+        VehAge = "Missing"
+
+    This allows missingness itself to have a model coefficient.
     """
 
     train = train.copy()
@@ -225,12 +258,18 @@ def fill_missing_categories(train, validation, test):
 
     for variable in RATING_VARIABLES:
 
-        train[variable] = train[variable].astype("object").fillna("Missing")
+        train[variable] = (
+            train[variable]
+            .astype("object")
+            .fillna("Missing")
+        )
+
         validation[variable] = (
             validation[variable]
             .astype("object")
             .fillna("Missing")
         )
+
         test[variable] = (
             test[variable]
             .astype("object")
@@ -246,47 +285,57 @@ def fill_missing_categories(train, validation, test):
 
 def create_one_hot_features(train, validation, test):
     """
-    Convert all rating variables into one-hot binary features.
+    Convert rating variables into reference-cell encoded features.
 
-    Categories are learned from the training data.
-
-    The same columns are then applied to validation and test.
+    One category from EACH rating variable is intentionally omitted.
 
     Example:
 
         VehGas
 
-        A
-        B
+            A
+            D
 
     becomes:
 
+            VehGas_D
+
+    where A is the reference category.
+
+    Why?
+
+    The Poisson model contains an intercept.
+
+    If we kept both:
+
+        Intercept
         VehGas_A
-        VehGas_B
+        VehGas_D
 
-    with values of 0 or 1.
+    then:
 
-    Unlike traditional GLM reference-cell encoding, we intentionally
-    keep ALL one-hot columns here.
+        Intercept = VehGas_A + VehGas_D
 
-    This gives downstream scripts a completely numeric modeling dataset.
+    which creates perfect multicollinearity and makes the Hessian
+    singular.
+
+    By dropping one category from each variable, the design matrix
+    becomes full rank.
+
+    Categories are learned from the training data only.
+    The same feature columns are then applied to validation and test.
     """
 
     train = train.copy()
     validation = validation.copy()
     test = test.copy()
 
-    encoded_train = pd.DataFrame(
-        index=train.index
-    )
+    encoded_train = pd.DataFrame(index=train.index)
+    encoded_validation = pd.DataFrame(index=validation.index)
+    encoded_test = pd.DataFrame(index=test.index)
 
-    encoded_validation = pd.DataFrame(
-        index=validation.index
-    )
-
-    encoded_test = pd.DataFrame(
-        index=test.index
-    )
+    # Store the reference categories so we can print them later.
+    reference_categories = {}
 
     for variable in RATING_VARIABLES:
 
@@ -294,6 +343,43 @@ def create_one_hot_features(train, validation, test):
         categories = sorted(
             train[variable].astype(str).unique()
         )
+
+        if len(categories) < 2:
+            raise ValueError(
+                f"{variable} has fewer than two categories in "
+                "the training data."
+            )
+
+        # ---------------------------------------------------------------
+        # Reference category
+        # ---------------------------------------------------------------
+        #
+        # The first sorted category becomes the reference category.
+        #
+        # Example:
+        #
+        # categories = ["A", "D"]
+        #
+        # reference = "A"
+        #
+        # We create:
+        #
+        #     VehGas_D
+        #
+        # but not:
+        #
+        #     VehGas_A
+        #
+        reference_category = categories[0]
+
+        reference_categories[variable] = reference_category
+
+        model_categories = categories[1:]
+
+        # ---------------------------------------------------------------
+        # Convert each dataset into categorical data using the
+        # training categories.
+        # ---------------------------------------------------------------
 
         train_category = pd.Categorical(
             train[variable].astype(str),
@@ -309,6 +395,12 @@ def create_one_hot_features(train, validation, test):
             test[variable].astype(str),
             categories=categories,
         )
+
+        # ---------------------------------------------------------------
+        # One-hot encode.
+        #
+        # We deliberately remove the reference category.
+        # ---------------------------------------------------------------
 
         train_encoded = pd.get_dummies(
             train_category,
@@ -328,7 +420,28 @@ def create_one_hot_features(train, validation, test):
             dtype=np.int8,
         )
 
+        # Remove the reference-category column.
+        reference_column = f"{variable}_{reference_category}"
+
+        if reference_column in train_encoded.columns:
+            train_encoded = train_encoded.drop(
+                columns=reference_column
+            )
+
+        if reference_column in validation_encoded.columns:
+            validation_encoded = validation_encoded.drop(
+                columns=reference_column
+            )
+
+        if reference_column in test_encoded.columns:
+            test_encoded = test_encoded.drop(
+                columns=reference_column
+            )
+
+        # ---------------------------------------------------------------
         # Explicitly align validation/test to training columns.
+        # ---------------------------------------------------------------
+
         validation_encoded = validation_encoded.reindex(
             columns=train_encoded.columns,
             fill_value=0,
@@ -339,6 +452,7 @@ def create_one_hot_features(train, validation, test):
             fill_value=0,
         )
 
+        # Add this variable's encoded columns to the full matrix.
         encoded_train = pd.concat(
             [encoded_train, train_encoded],
             axis=1,
@@ -354,10 +468,18 @@ def create_one_hot_features(train, validation, test):
             axis=1,
         )
 
+    # Print the reference categories so the user knows exactly
+    # what the model baseline will be.
+    print("\nReference categories:")
+
+    for variable, category in reference_categories.items():
+        print(f"  {variable}: {category}")
+
     return (
         encoded_train,
         encoded_validation,
         encoded_test,
+        reference_categories,
     )
 
 
@@ -428,15 +550,22 @@ def create_final_datasets(
 # ---------------------------------------------------------------------------
 
 def validate_datasets(train, validation, test):
-    """Perform basic checks on the resulting datasets."""
+    """Perform checks on the resulting datasets."""
 
     print("\nValidating datasets...")
 
-    # Same columns.
+    # -----------------------------------------------------------------------
+    # Same columns
+    # -----------------------------------------------------------------------
+
     assert list(train.columns) == list(validation.columns)
+
     assert list(train.columns) == list(test.columns)
 
-    # No missing values in model features.
+    # -----------------------------------------------------------------------
+    # No missing values in model features
+    # -----------------------------------------------------------------------
+
     feature_columns = [
         column
         for column in train.columns
@@ -452,14 +581,23 @@ def validate_datasets(train, validation, test):
         ("validation", validation),
         ("test", test),
     ]:
-        missing = dataset[feature_columns].isna().sum().sum()
 
-        assert missing == 0, (
-            f"{dataset_name} contains {missing} missing "
-            "feature values."
+        missing = (
+            dataset[feature_columns]
+            .isna()
+            .sum()
+            .sum()
         )
 
-    # One-hot variables should contain only 0/1.
+        assert missing == 0, (
+            f"{dataset_name} contains {missing} "
+            "missing feature values."
+        )
+
+    # -----------------------------------------------------------------------
+    # One-hot variables should contain only 0/1
+    # -----------------------------------------------------------------------
+
     rating_columns = [
         column
         for column in train.columns
@@ -474,6 +612,7 @@ def validate_datasets(train, validation, test):
         ("validation", validation),
         ("test", test),
     ]:
+
         unique_values = np.unique(
             dataset[rating_columns].to_numpy()
         )
@@ -484,6 +623,39 @@ def validate_datasets(train, validation, test):
             f"{dataset_name} contains non-binary "
             "rating features."
         )
+
+    # -----------------------------------------------------------------------
+    # Every observation should belong to exactly one category for
+    # each original rating variable.
+    #
+    # Because we use reference-cell encoding, the sum will be:
+    #
+    #     0 -> observation is in the reference category
+    #     1 -> observation is in a non-reference category
+    #
+    # It should NEVER be greater than 1.
+    # -----------------------------------------------------------------------
+
+    for dataset_name, dataset in [
+        ("train", train),
+        ("validation", validation),
+        ("test", test),
+    ]:
+
+        for variable in RATING_VARIABLES:
+
+            columns = [
+                column
+                for column in dataset.columns
+                if column.startswith(f"{variable}_")
+            ]
+
+            category_sum = dataset[columns].sum(axis=1)
+
+            assert (category_sum <= 1).all(), (
+                f"{dataset_name} has an observation with "
+                f"multiple active categories for {variable}."
+            )
 
     print("Validation passed.")
 
@@ -566,7 +738,9 @@ def main():
     # Missing -> explicit category
     # -----------------------------------------------------------------------
 
-    print("Converting missing values to explicit categories...")
+    print(
+        "Converting missing values to explicit categories..."
+    )
 
     (
         train,
@@ -579,15 +753,18 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # One-hot encoding
+    # Reference-cell one-hot encoding
     # -----------------------------------------------------------------------
 
-    print("Creating one-hot encoded features...")
+    print(
+        "Creating reference-cell encoded features..."
+    )
 
     (
         encoded_train,
         encoded_validation,
         encoded_test,
+        reference_categories,
     ) = create_one_hot_features(
         train,
         validation,
@@ -631,12 +808,21 @@ def main():
         test_final,
     )
 
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+
     print("\nFinal dataset dimensions:")
+
     print(f"Train:       {train_final.shape}")
     print(f"Validation:  {validation_final.shape}")
     print(f"Test:        {test_final.shape}")
 
+    print("\nReference categories used by the model:")
+
+    for variable, category in reference_categories.items():
+        print(f"  {variable}: {category}")
+
 
 if __name__ == "__main__":
     main()
-

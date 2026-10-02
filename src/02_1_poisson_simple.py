@@ -247,7 +247,7 @@ EXPOSURE = "Exposure"
 #
 # Exposure = offset
 
-INDEPENDENT_VARIABLE = "VehPower_(3.999, 5.0]"
+INDEPENDENT_VARIABLE = "VehPower_(5.0, 6.0]"
 
 
 # =============================================================================
@@ -572,6 +572,7 @@ for iteration in range(max_iterations):
     #
     # This is numerically more stable.
 
+    # np.linalg.solve(a, b) computes the exact solution x of a well-determined, full-rank linear matrix equation ax = b
     step = np.linalg.solve(
         hessian,
         gradient,
@@ -743,21 +744,70 @@ prediction_for_deviance = np.maximum(
 #
 #     prediction
 
-deviance = np.where(
-    y == 0,
+# deviance = np.where(
+#     y == 0,
 
-    prediction_for_deviance,
+#     prediction_for_deviance,
 
-    y * np.log(
-        y / prediction_for_deviance
-    )
-    - (y - prediction_for_deviance),
-)
-
+#     y * np.log(
+#         y / prediction_for_deviance
+#     )
+#     - (y - prediction_for_deviance),
+# )
 
 # The factor of 2 is part of the standard Poisson deviance formula.
 
-poisson_deviance = 2 * np.mean(deviance)
+# poisson_deviance = 2 * np.mean(deviance)
+
+def poisson_deviance_func(y, prediction):
+    """
+    Calculate mean Poisson deviance.
+
+    Lower is better.
+
+    For y = 0, the term:
+
+        y * log(y / prediction)
+
+    is defined as 0.
+    """
+
+    y = np.asarray(y, dtype=float)
+    prediction = np.asarray(prediction, dtype=float)
+
+    if y.shape != prediction.shape:
+        raise ValueError("y and prediction must have the same shape.")
+
+    if np.any(y < 0):
+        raise ValueError("Poisson targets cannot be negative.")
+
+    # Prediction must be strictly positive because it
+    # appears in the denominator and inside log().
+    prediction = np.maximum(prediction, 1e-12)
+
+    # Initialize the log term to zero.
+    # This correctly handles observations where y = 0.
+    log_term = np.zeros_like(y, dtype=float)
+
+    # Only calculate y * log(y / prediction)
+    # where y > 0.
+    nonzero_y = y > 0
+
+    log_term[nonzero_y] = (
+        y[nonzero_y]
+        * np.log(
+            y[nonzero_y] / prediction[nonzero_y]
+        )
+    )
+
+    # Calculate mean Poisson deviance.
+    deviance = 2 * np.mean(
+        log_term - (y - prediction)
+    )
+
+    return deviance
+
+poisson_deviance = poisson_deviance_func(y, prediction_for_deviance)
 
 
 print()
@@ -814,25 +864,27 @@ prediction_validation_for_deviance = np.maximum(
     1e-12,
 )
 
-deviance_validation = np.where(
-    y_validation == 0,
+# deviance_validation = np.where(
+#     y_validation == 0,
 
-    prediction_validation_for_deviance,
+#     prediction_validation_for_deviance,
 
-    y_validation
-    * np.log(
-        y_validation
-        / prediction_validation_for_deviance
-    )
-    - (
-        y_validation
-        - prediction_validation_for_deviance
-    ),
-)
+#     y_validation
+#     * np.log(
+#         y_validation
+#         / prediction_validation_for_deviance
+#     )
+#     - (
+#         y_validation
+#         - prediction_validation_for_deviance
+#     ),
+# )
 
-poisson_deviance_validation = (
-    2 * np.mean(deviance_validation)
-)
+# poisson_deviance_validation = (
+#     2 * np.mean(deviance_validation)
+# )
+
+poisson_deviance_validation = poisson_deviance_func(y_validation, prediction_validation_for_deviance)
 
 
 print(

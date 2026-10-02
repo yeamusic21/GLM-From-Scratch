@@ -28,7 +28,7 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = PROJECT_ROOT / "data" / "processed"
 MODEL_DIR = PROJECT_ROOT / "models"
 PREDICTION_DIR = PROJECT_ROOT / "predictions"
 
@@ -50,6 +50,8 @@ class PoissonRegression:
         E[y] = exposure * exp(X @ beta)
 
     where exposure is supplied separately as an offset.
+
+    Note, this is the same as log(E[ClaimNb]) = log(Exposure) + X @ beta
     """
 
     def __init__(self, max_iter=100, tolerance=1e-8):
@@ -88,12 +90,14 @@ class PoissonRegression:
         for iteration in range(self.max_iter):
 
             # Linear predictor.
+            # given this version of the equation, log(mu) = eta, i.e. this equation outputs log(mu)
             eta = offset + X @ beta
 
             # Prevent overflow in exp().
             eta = np.clip(eta, -50, 50)
 
             # Expected claim count.
+            # remember that log(mu) = eta, thus mu = exp(eta)
             mu = np.exp(eta)
 
             # Gradient.
@@ -157,20 +161,48 @@ def poisson_deviance(y, prediction):
     Calculate mean Poisson deviance.
 
     Lower is better.
+
+    For y = 0, the term:
+
+        y * log(y / prediction)
+
+    is defined as 0.
     """
 
     y = np.asarray(y, dtype=float)
     prediction = np.asarray(prediction, dtype=float)
 
+    if y.shape != prediction.shape:
+        raise ValueError("y and prediction must have the same shape.")
+
+    if np.any(y < 0):
+        raise ValueError("Poisson targets cannot be negative.")
+
+    # Prediction must be strictly positive because it
+    # appears in the denominator and inside log().
     prediction = np.maximum(prediction, 1e-12)
 
-    deviance = np.where(
-        y == 0,
-        prediction,
-        y * np.log(y / prediction) - (y - prediction),
+    # Initialize the log term to zero.
+    # This correctly handles observations where y = 0.
+    log_term = np.zeros_like(y, dtype=float)
+
+    # Only calculate y * log(y / prediction)
+    # where y > 0.
+    nonzero_y = y > 0
+
+    log_term[nonzero_y] = (
+        y[nonzero_y]
+        * np.log(
+            y[nonzero_y] / prediction[nonzero_y]
+        )
     )
 
-    return 2 * np.mean(deviance)
+    # Calculate mean Poisson deviance.
+    deviance = 2 * np.mean(
+        log_term - (y - prediction)
+    )
+
+    return deviance
 
 
 def evaluate_model(model, data, name):
@@ -232,8 +264,8 @@ def main():
     print("\nFitting Poisson frequency model...")
 
     model = PoissonRegression(
-        max_iter=100,
-        tolerance=1e-8,
+        max_iter=200,
+        tolerance=1e-5,
     )
 
     model.fit(
